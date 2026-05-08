@@ -1,11 +1,11 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   Plus, Trash2, Wallet, ShoppingBag, Car, Home, Heart,
   Music, ShoppingCart, Zap, BookOpen, MoreHorizontal,
   X, ChevronDown, TrendingUp, Calendar,
   PieChart as PieIcon, Lightbulb, Target, Shield, Repeat,
   CreditCard, Coins, Star,
-  Mail, Lock, User, LogOut, Eye, EyeOff,
+  Mail, Lock, User, LogOut, Eye, EyeOff, Edit2, Key, Camera, Download,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
@@ -15,7 +15,8 @@ import {
 // ─── EmailJS Configuration ────────────────────────────────────────────────────
 const EMAILJS_SERVICE_ID  = 'service_jocc9op';
 const EMAILJS_TEMPLATE_ID = 'template_mh4hdfr';
-const EMAILJS_PUBLIC_KEY  = 'LftDBiFBE-95S_apT';
+const EMAILJS_PUBLIC_KEY          = 'LftDBiFBE-95S_apT';
+const EMAILJS_CONTACT_TEMPLATE_ID = 'template_contact'; // set your contact template ID here
 
 // ─── Category Registry ────────────────────────────────────────────────────────
 const CATEGORIES = [
@@ -29,7 +30,17 @@ const CATEGORIES = [
   { id: "education",     label: "Education",        Icon: BookOpen,       color: "#10b981", ring: "bg-emerald-500/15", text: "text-emerald-400" },
   { id: "other",         label: "Other",            Icon: MoreHorizontal, color: "#6b7280", ring: "bg-slate-500/15",   text: "text-slate-400"   },
 ];
-const getCat = (id) => CATEGORIES.find((c) => c.id === id) ?? CATEGORIES[8];
+const INCOME_CATEGORIES = [
+  { id: "salary",     label: "Salary",     Icon: Wallet,         color: "#10b981", ring: "bg-emerald-500/15", text: "text-emerald-400" },
+  { id: "freelance",  label: "Freelance",  Icon: Star,           color: "#3b82f6", ring: "bg-blue-500/15",    text: "text-blue-400"    },
+  { id: "investment", label: "Investment", Icon: TrendingUp,     color: "#8b5cf6", ring: "bg-violet-500/15",  text: "text-violet-400"  },
+  { id: "gift",       label: "Gift",       Icon: Heart,          color: "#ec4899", ring: "bg-pink-500/15",    text: "text-pink-400"    },
+  { id: "other_inc",  label: "Other",      Icon: MoreHorizontal, color: "#6b7280", ring: "bg-slate-500/15",   text: "text-slate-400"   },
+];
+const getCat = (id) =>
+  CATEGORIES.find((c) => c.id === id) ??
+  INCOME_CATEGORIES.find((c) => c.id === id) ??
+  CATEGORIES[8];
 
 // ─── Expense Storage Adapter ──────────────────────────────────────────────────
 // Phase 4: replace load/save with fetch('/api/expenses') GET & POST
@@ -77,22 +88,41 @@ const usersStore = {
   },
 };
 
+// ─── Balance Storage Adapter ──────────────────────────────────────────────────
+const balanceStore = {
+  async load(email) {
+    try {
+      const raw = localStorage.getItem(`balance:${email}`);
+      return raw !== null ? parseFloat(raw) : 0;
+    } catch { return 0; }
+  },
+  async save(email, balance) {
+    try { localStorage.setItem(`balance:${email}`, String(balance)); } catch {}
+  },
+};
+
+// ─── Settings Storage Adapter ─────────────────────────────────────────────────
+const settingsStore = {
+  async load(email) {
+    try {
+      const raw = localStorage.getItem(`settings:${email}`);
+      return raw ? JSON.parse(raw) : { monthlyBudget: "", currency: "EUR", lastProcessedMonth: "" };
+    } catch { return { monthlyBudget: "", currency: "EUR", lastProcessedMonth: "" }; }
+  },
+  async save(email, s) {
+    try { localStorage.setItem(`settings:${email}`, JSON.stringify(s)); } catch {}
+  },
+};
+
 // ─── Mock Auth API ────────────────────────────────────────────────────────────
 // Phase 4: replace mockLogin/mockRegister bodies with fetch calls to /auth/login and /auth/register.
-
-const _pendingVerifications = {}; // { [email]: code } — in-memory until verified
 
 async function mockLogin({ email, password }) {
   await new Promise((r) => setTimeout(r, 700));
   if (!email || !password) throw new Error("Please fill in all fields.");
   const users = await usersStore.load();
   const stored = users[email];
-  if (!stored || stored.password !== password) throw new Error("Invalid email or password.");
-  if (!stored.isVerified) {
-    const err = new Error("EMAIL_NOT_VERIFIED");
-    err.unverifiedEmail = email;
-    throw err;
-  }
+  if (!stored || stored.password !== password || !stored.isVerified) throw new Error("Invalid email or password.");
   return { token: "mock-jwt-" + Date.now(), user: { email: stored.email, name: stored.name } };
 }
 
@@ -101,15 +131,14 @@ async function mockRegister({ name, email, password }) {
   if (!name || !email || !password) throw new Error("Please fill in all fields.");
   if (password.length < 6) throw new Error("Password must be at least 6 characters.");
   const users = await usersStore.load();
-  if (users[email]) throw new Error("An account with this email already exists.");
-  users[email] = { name, email, password, isVerified: false };
-  await usersStore.save(users);
+  if (users[email]?.isVerified) throw new Error("An account with this email already exists.");
+  // User is NOT saved here — saved only after email verification succeeds.
   return { needsVerification: true, email };
 }
 
 async function sendVerificationCodeAPI({ email }) {
   const code = String(Math.floor(100000 + Math.random() * 900000));
-  _pendingVerifications[email] = code;
+  sessionStorage.setItem(`verify_code:${email}`, code); // sessionStorage survives hot-reloads
   const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -124,16 +153,45 @@ async function sendVerificationCodeAPI({ email }) {
   return { success: true };
 }
 
-async function verifyCodeAPI({ email, code }) {
-  const expected = _pendingVerifications[email];
+async function verifyCodeAPI({ email, code, pendingUser }) {
+  const expected = sessionStorage.getItem(`verify_code:${email}`);
   if (!expected) throw new Error("Verification session expired. Please sign up again.");
   if (code !== expected) throw new Error("Incorrect code. Please try again.");
-  delete _pendingVerifications[email];
+  sessionStorage.removeItem(`verify_code:${email}`);
+  // Only now do we permanently save the verified user to localStorage.
   const users = await usersStore.load();
-  users[email].isVerified = true;
+  users[email] = { name: pendingUser.name, email, password: pendingUser.password, isVerified: true };
   await usersStore.save(users);
-  const u = users[email];
-  return { token: "mock-jwt-" + Date.now(), user: { email: u.email, name: u.name } };
+  return { token: "mock-jwt-" + Date.now(), user: { email, name: pendingUser.name } };
+}
+
+async function sendPasswordResetCodeAPI({ email }) {
+  const users = await usersStore.load();
+  if (!users[email]?.isVerified) throw new Error("No account found with that email.");
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  sessionStorage.setItem(`reset_code:${email}`, code);
+  const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      service_id:  EMAILJS_SERVICE_ID,
+      template_id: EMAILJS_TEMPLATE_ID,
+      user_id:     EMAILJS_PUBLIC_KEY,
+      template_params: { to_email: email, verification_code: code },
+    }),
+  });
+  if (!res.ok) throw new Error("Failed to send reset email. Please try again.");
+  return { success: true };
+}
+
+async function verifyPasswordResetCode({ email, code, newPassword }) {
+  const expected = sessionStorage.getItem(`reset_code:${email}`);
+  if (!expected || code !== expected) throw new Error("Incorrect code. Please try again.");
+  sessionStorage.removeItem(`reset_code:${email}`);
+  const users = await usersStore.load();
+  if (!users[email]?.isVerified) throw new Error("Incorrect code. Please try again.");
+  users[email].password = newPassword;
+  await usersStore.save(users);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -162,13 +220,14 @@ const NAV_TABS = [
   { id: "tracker",   label: "Tracker",   Icon: Wallet    },
   { id: "analytics", label: "Analytics", Icon: PieIcon   },
   { id: "tips",      label: "Tips",      Icon: Lightbulb },
+  { id: "profile",   label: "Profile",   Icon: User      },
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // AUTH SCREEN
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function VerifyEmailScreen({ email, onVerified, onBack }) {
+function VerifyEmailScreen({ email, pendingUser, onVerified, onBack }) {
   const [code, setCode]       = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError]     = useState("");
@@ -179,7 +238,7 @@ function VerifyEmailScreen({ email, onVerified, onBack }) {
     setLoading(true);
     setError("");
     try {
-      const session = await verifyCodeAPI({ email, code });
+      const session = await verifyCodeAPI({ email, code, pendingUser });
       await authStore.save(session);
       onVerified(session);
     } catch (err) {
@@ -263,6 +322,143 @@ function VerifyEmailScreen({ email, onVerified, onBack }) {
   );
 }
 
+function ForgotPasswordScreen({ onBack, onSuccess }) {
+  const [step,      setStep]      = useState(1);
+  const [email,     setEmail]     = useState("");
+  const [code,      setCode]      = useState("");
+  const [newPw,     setNewPw]     = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [showPw,    setShowPw]    = useState(false);
+  const [loading,   setLoading]   = useState(false);
+  const [error,     setError]     = useState("");
+
+  const handleSendCode = async (e) => {
+    e.preventDefault();
+    if (!email) { setError("Enter your email address."); return; }
+    setLoading(true);
+    setError("");
+    try {
+      await sendPasswordResetCodeAPI({ email });
+      setStep(2);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleReset = async (e) => {
+    e.preventDefault();
+    if (code.length !== 6)   { setError("Enter the full 6-digit code."); return; }
+    if (newPw.length < 6)    { setError("Password must be at least 6 characters."); return; }
+    if (newPw !== confirmPw) { setError("Passwords do not match."); return; }
+    setLoading(true);
+    setError("");
+    try {
+      await verifyPasswordResetCode({ email, code, newPassword: newPw });
+      onSuccess("Password updated successfully. Please sign in.");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-[#0f172a] flex flex-col items-center justify-center px-4 relative overflow-hidden">
+      <div className="absolute -top-32 left-1/2 -translate-x-1/2 w-[500px] h-[500px] rounded-full bg-emerald-500/5 blur-3xl pointer-events-none" />
+
+      <div className="w-full max-w-sm relative z-10">
+        <div className="flex flex-col items-center mb-7">
+          <div className="w-16 h-16 rounded-2xl bg-emerald-500/15 border border-emerald-500/20 flex items-center justify-center mb-4">
+            <Key size={28} className="text-emerald-400" />
+          </div>
+          <h1 className="text-2xl font-black text-white tracking-tight">Reset Password</h1>
+          <p className="text-slate-500 text-sm mt-1 text-center leading-relaxed">
+            {step === 1
+              ? "Enter your email and we'll send a reset code."
+              : <><span>Code sent to </span><span className="text-slate-300 font-semibold">{email}</span></>}
+          </p>
+        </div>
+
+        {step === 1 ? (
+          <form onSubmit={handleSendCode} className="flex flex-col gap-3">
+            <div className="relative">
+              <Mail size={15} className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+              <input
+                type="email" placeholder="Email Address" value={email}
+                onChange={(e) => { setEmail(e.target.value); setError(""); }}
+                className="w-full bg-[#1e293b] border border-slate-700 rounded-2xl pl-11 pr-4 py-3.5 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-emerald-500 transition-colors"
+                autoFocus
+              />
+            </div>
+            {error && (
+              <div className="bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3">
+                <p className="text-red-400 text-sm font-medium">{error}</p>
+              </div>
+            )}
+            <button type="submit" disabled={loading}
+              className="mt-1 w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 disabled:cursor-not-allowed active:scale-[0.98] text-white font-bold py-4 rounded-2xl transition-all text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2">
+              {loading ? (
+                <><div className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" /><span>Sending…</span></>
+              ) : "Send Reset Code"}
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={handleReset} className="flex flex-col gap-3">
+            <div>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-widest mb-1.5">Verification Code</label>
+              <input
+                type="text" inputMode="numeric" pattern="[0-9]*" maxLength={6} placeholder="······"
+                value={code} onChange={(e) => { setCode(e.target.value.replace(/\D/g, "")); setError(""); }}
+                className="w-full bg-[#1e293b] border border-slate-700 rounded-2xl px-4 py-4 text-white text-3xl font-black text-center tracking-[0.6em] placeholder-slate-700 focus:outline-none focus:border-emerald-500 transition-colors"
+                autoFocus
+              />
+            </div>
+            <div className="relative">
+              <Lock size={15} className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+              <input
+                type={showPw ? "text" : "password"} placeholder="New Password" value={newPw}
+                onChange={(e) => { setNewPw(e.target.value); setError(""); }}
+                className="w-full bg-[#1e293b] border border-slate-700 rounded-2xl pl-11 pr-12 py-3.5 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-emerald-500 transition-colors"
+              />
+              <button type="button" onClick={() => setShowPw((v) => !v)}
+                className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 transition-colors"
+                aria-label={showPw ? "Hide password" : "Show password"}>
+                {showPw ? <EyeOff size={15} /> : <Eye size={15} />}
+              </button>
+            </div>
+            <div className="relative">
+              <Lock size={15} className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+              <input
+                type={showPw ? "text" : "password"} placeholder="Confirm New Password" value={confirmPw}
+                onChange={(e) => { setConfirmPw(e.target.value); setError(""); }}
+                className="w-full bg-[#1e293b] border border-slate-700 rounded-2xl pl-11 pr-4 py-3.5 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-emerald-500 transition-colors"
+              />
+            </div>
+            {error && (
+              <div className="bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3">
+                <p className="text-red-400 text-sm font-medium">{error}</p>
+              </div>
+            )}
+            <button type="submit" disabled={loading}
+              className="mt-1 w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 disabled:cursor-not-allowed active:scale-[0.98] text-white font-bold py-4 rounded-2xl transition-all text-sm shadow-lg shadow-emerald-500/25 flex items-center justify-center gap-2">
+              {loading ? (
+                <><div className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" /><span>Updating…</span></>
+              ) : "Update Password"}
+            </button>
+          </form>
+        )}
+
+        <button type="button" onClick={onBack}
+          className="w-full text-center text-slate-600 text-xs mt-5 hover:text-slate-400 transition-colors py-2">
+          ← Back to sign in
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function AuthScreen({ onAuth }) {
   const [mode, setMode]               = useState("login"); // "login" | "register"
   const [form, setForm]               = useState({ name: "", email: "", password: "" });
@@ -270,11 +466,14 @@ function AuthScreen({ onAuth }) {
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState("");
   const [pendingEmail, setPendingEmail] = useState(null);
+  const [pendingUser,  setPendingUser]  = useState(null);
+  const [showForgot,   setShowForgot]   = useState(false);
+  const [successMsg,   setSuccessMsg]   = useState("");
 
   const isLogin = mode === "login";
-  const set = (k, v) => { setForm((f) => ({ ...f, [k]: v })); setError(""); };
+  const set = (k, v) => { setForm((f) => ({ ...f, [k]: v })); setError(""); setSuccessMsg(""); };
 
-  const switchMode = (m) => { setMode(m); setError(""); setForm({ name: "", email: "", password: "" }); };
+  const switchMode = (m) => { setMode(m); setError(""); setSuccessMsg(""); setForm({ name: "", email: "", password: "" }); };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -286,17 +485,14 @@ function AuthScreen({ onAuth }) {
         : await mockRegister({ name: form.name, email: form.email, password: form.password });
       if (result.needsVerification) {
         await sendVerificationCodeAPI({ email: result.email });
+        setPendingUser({ name: form.name, email: form.email, password: form.password });
         setPendingEmail(result.email);
         return;
       }
       await authStore.save(result);
       onAuth(result);
     } catch (err) {
-      if (err.message === "EMAIL_NOT_VERIFIED") {
-        await sendVerificationCodeAPI({ email: err.unverifiedEmail });
-        setPendingEmail(err.unverifiedEmail);
-      }
-      else { setError(err.message); }
+      setError(err.message);
     } finally {
       setLoading(false);
     }
@@ -306,8 +502,18 @@ function AuthScreen({ onAuth }) {
     return (
       <VerifyEmailScreen
         email={pendingEmail}
+        pendingUser={pendingUser}
         onVerified={onAuth}
-        onBack={() => setPendingEmail(null)}
+        onBack={() => { setPendingEmail(null); setPendingUser(null); }}
+      />
+    );
+  }
+
+  if (showForgot) {
+    return (
+      <ForgotPasswordScreen
+        onBack={() => setShowForgot(false)}
+        onSuccess={(msg) => { setShowForgot(false); setSuccessMsg(msg); }}
       />
     );
   }
@@ -346,6 +552,13 @@ function AuthScreen({ onAuth }) {
             </button>
           ))}
         </div>
+
+        {/* Success banner */}
+        {successMsg && (
+          <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-4 py-3 mb-3">
+            <p className="text-emerald-400 text-sm font-medium text-center">{successMsg}</p>
+          </div>
+        )}
 
         {/* Form */}
         <form onSubmit={handleSubmit} className="flex flex-col gap-3">
@@ -399,6 +612,19 @@ function AuthScreen({ onAuth }) {
             </button>
           </div>
 
+          {/* Forgot password */}
+          {isLogin && (
+            <div className="flex justify-end -mt-1">
+              <button
+                type="button"
+                onClick={() => { setShowForgot(true); setError(""); }}
+                className="text-xs text-slate-500 hover:text-emerald-400 transition-colors font-medium"
+              >
+                Forgot password?
+              </button>
+            </div>
+          )}
+
           {/* Error */}
           {error && (
             <div className="bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3">
@@ -443,7 +669,8 @@ function AuthScreen({ onAuth }) {
 // SHARED UI COMPONENTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function HeroCard({ monthTotal, todayTotal }) {
+function HeroCard({ availableBalance, monthTotal, todayTotal, onEditBalance }) {
+  const isNegative = availableBalance < 0;
   return (
     <div
       className="relative rounded-3xl p-6 overflow-hidden"
@@ -451,11 +678,28 @@ function HeroCard({ monthTotal, todayTotal }) {
     >
       <div className="absolute -top-8 -right-8 w-40 h-40 rounded-full bg-white/10" />
       <div className="absolute -bottom-10 -left-10 w-32 h-32 rounded-full bg-white/5" />
-      <p className="text-emerald-100 text-xs font-semibold uppercase tracking-widest mb-1">Monthly Spending</p>
-      <p className="text-4xl font-black text-white tracking-tight mb-4">{fmt(monthTotal)}</p>
-      <div className="flex items-center gap-2 bg-white/15 rounded-2xl px-4 py-2 backdrop-blur-sm w-fit">
-        <Calendar size={14} className="text-emerald-100" />
-        <span className="text-emerald-50 text-sm font-medium">Today · {fmt(todayTotal)}</span>
+
+      <button
+        onClick={onEditBalance}
+        className="absolute top-5 right-5 w-8 h-8 rounded-xl bg-white/20 hover:bg-white/30 flex items-center justify-center transition-colors"
+        aria-label="Set balance"
+      >
+        <Edit2 size={13} className="text-white" />
+      </button>
+
+      <p className="text-emerald-100 text-xs font-semibold uppercase tracking-widest mb-1 pr-10">Available Balance</p>
+      <p className={`text-4xl font-black tracking-tight mb-4 ${isNegative ? "text-red-200" : "text-white"}`}>
+        {fmt(availableBalance)}
+      </p>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-2 bg-white/15 rounded-2xl px-3 py-2 backdrop-blur-sm">
+          <Calendar size={13} className="text-emerald-100" />
+          <span className="text-emerald-50 text-xs font-semibold">Month · {fmt(monthTotal)}</span>
+        </div>
+        <div className="flex items-center gap-2 bg-white/15 rounded-2xl px-3 py-2 backdrop-blur-sm">
+          <span className="text-emerald-50 text-xs font-semibold">Today · {fmt(todayTotal)}</span>
+        </div>
       </div>
     </div>
   );
@@ -573,6 +817,63 @@ function ExpenseRow({ expense, onDelete }) {
         >
           <Trash2 size={13} />
         </button>
+      </div>
+    </div>
+  );
+}
+
+function SetBalanceModal({ current, onSave, onClose }) {
+  const [value, setValue] = useState(current > 0 ? String(current) : "");
+  const [error, setError] = useState("");
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    const amt = parseFloat(value);
+    if (isNaN(amt) || amt < 0) { setError("Enter a valid amount."); return; }
+    onSave(parseFloat(amt.toFixed(2)));
+    onClose();
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/70 backdrop-blur-sm"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <div className="w-full max-w-md bg-[#0f172a] rounded-t-3xl sm:rounded-3xl border border-slate-800 shadow-2xl">
+        <div className="flex justify-center pt-3 pb-1 sm:hidden">
+          <div className="w-10 h-1 rounded-full bg-slate-700" />
+        </div>
+        <div className="px-6 pt-4 pb-6">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-lg font-bold text-white">Set Your Balance</h2>
+            <button onClick={onClose} className="p-2 rounded-xl hover:bg-slate-800 text-slate-400 hover:text-white transition-colors">
+              <X size={18} />
+            </button>
+          </div>
+          <p className="text-slate-500 text-sm mb-5">Enter your current available funds. Expenses are deducted automatically.</p>
+          <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+            <div>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-widest mb-1.5">Amount (€)</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                placeholder="0.00"
+                value={value}
+                onChange={(e) => { setValue(e.target.value); setError(""); }}
+                className="w-full bg-[#1e293b] border border-slate-700 rounded-2xl px-4 py-3.5 text-white text-2xl font-black placeholder-slate-700 focus:outline-none focus:border-emerald-500 transition-colors"
+                autoFocus
+              />
+            </div>
+            {error && <p className="text-red-400 text-sm font-medium">{error}</p>}
+            <button
+              type="submit"
+              className="mt-1 w-full bg-emerald-500 hover:bg-emerald-400 active:scale-[0.98] text-white font-bold py-4 rounded-2xl transition-all text-base shadow-lg shadow-emerald-500/25"
+            >
+              Save Balance
+            </button>
+          </form>
+        </div>
       </div>
     </div>
   );
@@ -786,6 +1087,258 @@ function TrackerPieChart({ expenses }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// PROFILE VIEW
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function ProfileView({ user, onLogout, settings, onSaveSettings, onUpdateUser }) {
+  const [local,          setLocal]          = useState(settings);
+  const [saved,          setSaved]          = useState(false);
+  const [showContact,    setShowContact]    = useState(false);
+  const [contact,        setContact]        = useState({ subject: "", message: "" });
+  const [contactLoading, setContactLoading] = useState(false);
+  const [contactMsg,     setContactMsg]     = useState({ type: "", text: "" });
+  const [editingName,    setEditingName]    = useState(false);
+  const [nameInput,      setNameInput]      = useState(user.name);
+  const fileInputRef = useRef(null);
+
+  const CURRENCIES = ["EUR", "USD", "GBP", "CHF", "JPY", "CAD", "AUD"];
+
+  const handleSave = () => {
+    onSaveSettings(local);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2500);
+  };
+
+  const saveName = async () => {
+    const trimmed = nameInput.trim();
+    if (!trimmed) return;
+    setEditingName(false);
+    await onUpdateUser({ name: trimmed });
+  };
+
+  const handleAvatarChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const base64 = ev.target?.result;
+      if (base64) await onUpdateUser({ avatarUrl: base64 });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const setC = (k, v) => setContact((f) => ({ ...f, [k]: v }));
+
+  const handleContact = async (e) => {
+    e.preventDefault();
+    if (!contact.subject.trim() || !contact.message.trim()) {
+      setContactMsg({ type: "error", text: "Please fill in all fields." });
+      return;
+    }
+    setContactLoading(true);
+    setContactMsg({ type: "", text: "" });
+    try {
+      const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          service_id:  EMAILJS_SERVICE_ID,
+          template_id: EMAILJS_CONTACT_TEMPLATE_ID,
+          user_id:     EMAILJS_PUBLIC_KEY,
+          template_params: {
+            from_name:  user.name,
+            from_email: user.email,
+            subject:    contact.subject,
+            message:    contact.message,
+          },
+        }),
+      });
+      if (!res.ok) throw new Error("Failed to send. Check your contact template ID.");
+      setContactMsg({ type: "success", text: "Message sent! We'll get back to you soon." });
+      setContact({ subject: "", message: "" });
+    } catch (err) {
+      setContactMsg({ type: "error", text: err.message });
+    } finally {
+      setContactLoading(false);
+    }
+  };
+
+  return (
+    <>
+      <TabHeader eyebrow="Your Account" title="Profile" Icon={User} />
+
+      {/* User Info */}
+      <div className="bg-[#1e293b] rounded-2xl p-5 mb-4">
+        <div className="flex items-center gap-4">
+          {/* Clickable avatar */}
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="relative w-16 h-16 rounded-2xl overflow-hidden shrink-0 group focus:outline-none"
+            aria-label="Change profile picture"
+          >
+            {user.avatarUrl ? (
+              <img src={user.avatarUrl} alt="avatar" className="w-full h-full object-cover" />
+            ) : (
+              <div className="w-full h-full bg-emerald-500/15 border border-emerald-500/20 flex items-center justify-center">
+                <User size={26} className="text-emerald-400" />
+              </div>
+            )}
+            <div className="absolute inset-0 bg-black/55 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+              <Camera size={18} className="text-white" />
+            </div>
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={handleAvatarChange}
+          />
+
+          {/* Name + email */}
+          <div className="flex-1 min-w-0">
+            {editingName ? (
+              <div className="flex flex-col gap-2">
+                <input
+                  value={nameInput}
+                  onChange={(e) => setNameInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") saveName(); if (e.key === "Escape") setEditingName(false); }}
+                  className="w-full bg-[#0f172a] border border-emerald-500 rounded-xl px-3 py-1.5 text-white text-sm font-bold focus:outline-none"
+                  autoFocus
+                />
+                <div className="flex gap-3">
+                  <button onClick={saveName} className="text-xs font-bold text-emerald-400 hover:text-emerald-300 transition-colors">Save</button>
+                  <button type="button" onClick={() => setEditingName(false)} className="text-xs text-slate-500 hover:text-slate-400 transition-colors">Cancel</button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 min-w-0">
+                <p className="text-white font-bold text-base leading-tight truncate">{user.name}</p>
+                <button
+                  type="button"
+                  onClick={() => { setNameInput(user.name); setEditingName(true); }}
+                  className="text-slate-500 hover:text-emerald-400 transition-colors shrink-0"
+                  aria-label="Edit name"
+                >
+                  <Edit2 size={13} />
+                </button>
+              </div>
+            )}
+            <p className="text-slate-400 text-sm mt-1 truncate">{user.email}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Preferences */}
+      <div className="bg-[#1e293b] rounded-2xl p-5 mb-4">
+        <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest mb-4">Preferences</p>
+        <div className="flex flex-col gap-3">
+          <div>
+            <label className="block text-xs font-semibold text-slate-400 uppercase tracking-widest mb-1.5">Monthly Budget (€)</label>
+            <input
+              type="number" min="0" step="0.01" placeholder="e.g. 1500.00"
+              value={local.monthlyBudget}
+              onChange={(e) => setLocal((s) => ({ ...s, monthlyBudget: e.target.value }))}
+              className="w-full bg-[#0f172a] border border-slate-700 rounded-xl px-4 py-3 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-emerald-500 transition-colors"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-slate-400 uppercase tracking-widest mb-1.5">Currency</label>
+            <div className="relative">
+              <select
+                value={local.currency}
+                onChange={(e) => setLocal((s) => ({ ...s, currency: e.target.value }))}
+                className="w-full bg-[#0f172a] border border-slate-700 rounded-xl px-4 py-3 text-white text-sm appearance-none focus:outline-none focus:border-emerald-500 transition-colors cursor-pointer"
+              >
+                {CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <ChevronDown size={14} className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" />
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={handleSave}
+          className={`mt-4 w-full py-3 rounded-xl font-bold text-sm transition-all ${
+            saved
+              ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30"
+              : "bg-emerald-500 hover:bg-emerald-400 text-white shadow-lg shadow-emerald-500/25"
+          }`}
+        >
+          {saved ? "✓ Saved!" : "Save Preferences"}
+        </button>
+      </div>
+
+      {/* Contact Support */}
+      <div className="bg-[#1e293b] rounded-2xl overflow-hidden mb-4">
+        <button
+          type="button"
+          onClick={() => setShowContact((v) => !v)}
+          className="w-full flex items-center justify-between px-5 py-4 text-left hover:bg-slate-800/50 transition-colors"
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-xl bg-blue-500/15 flex items-center justify-center">
+              <Mail size={14} className="text-blue-400" />
+            </div>
+            <span className="text-white font-semibold text-sm">Contact Support</span>
+          </div>
+          <ChevronDown size={16} className={`text-slate-500 transition-transform duration-200 ${showContact ? "rotate-180" : ""}`} />
+        </button>
+        {showContact && (
+          <div className="px-5 pb-5 border-t border-slate-800">
+            <p className="text-slate-500 text-xs mt-3 mb-3 leading-relaxed">
+              Have a question or feedback? Send us a message.
+            </p>
+            <form onSubmit={handleContact} className="flex flex-col gap-3">
+              <input
+                type="text" placeholder="Subject" value={contact.subject}
+                onChange={(e) => { setC("subject", e.target.value); setContactMsg({ type: "", text: "" }); }}
+                className="w-full bg-[#0f172a] border border-slate-700 rounded-xl px-4 py-3 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-emerald-500 transition-colors"
+              />
+              <textarea
+                placeholder="Your message…" value={contact.message} rows={4}
+                onChange={(e) => { setC("message", e.target.value); setContactMsg({ type: "", text: "" }); }}
+                className="w-full bg-[#0f172a] border border-slate-700 rounded-xl px-4 py-3 text-white text-sm placeholder-slate-600 focus:outline-none focus:border-emerald-500 transition-colors resize-none"
+              />
+              {contactMsg.text && (
+                <div className={`rounded-xl px-4 py-3 ${
+                  contactMsg.type === "success"
+                    ? "bg-emerald-500/10 border border-emerald-500/20"
+                    : "bg-red-500/10 border border-red-500/20"
+                }`}>
+                  <p className={`text-sm font-medium ${contactMsg.type === "success" ? "text-emerald-400" : "text-red-400"}`}>
+                    {contactMsg.text}
+                  </p>
+                </div>
+              )}
+              <button type="submit" disabled={contactLoading}
+                className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-60 disabled:cursor-not-allowed active:scale-[0.98] text-white font-bold py-3 rounded-xl transition-all text-sm flex items-center justify-center gap-2">
+                {contactLoading
+                  ? <><div className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" /><span>Sending…</span></>
+                  : "Send Message"
+                }
+              </button>
+            </form>
+          </div>
+        )}
+      </div>
+
+      {/* Danger Zone */}
+      <div className="border border-red-500/20 rounded-2xl p-5 mb-6">
+        <p className="text-xs font-semibold text-red-400/70 uppercase tracking-widest mb-3">Account</p>
+        <button
+          onClick={onLogout}
+          className="w-full flex items-center justify-center gap-2.5 py-3.5 rounded-xl border border-red-500/30 text-red-400 hover:bg-red-500/10 active:scale-[0.98] font-semibold text-sm transition-all"
+        >
+          <LogOut size={16} />
+          Sign Out
+        </button>
+      </div>
+    </>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TAB VIEWS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -814,11 +1367,11 @@ function TabHeader({ eyebrow, title, Icon, onLogout }) {
   );
 }
 
-function TrackerView({ expenses, onDelete, monthTotal, todayTotal, onAddClick, user, onLogout }) {
+function TrackerView({ expenses, onDelete, monthTotal, todayTotal, onAddClick, user, availableBalance, onEditBalance }) {
   return (
     <>
-      <TabHeader eyebrow={`Welcome back, ${user?.name ?? "there"}`} title="Overview" Icon={Wallet} onLogout={onLogout} />
-      <HeroCard monthTotal={monthTotal} todayTotal={todayTotal} />
+      <TabHeader eyebrow={`Welcome back, ${user?.name ?? "there"}`} title="Overview" Icon={Wallet} />
+      <HeroCard availableBalance={availableBalance} monthTotal={monthTotal} todayTotal={todayTotal} onEditBalance={onEditBalance} />
 
       <div className="mt-4 flex flex-col gap-3">
         <SevenDayChart expenses={expenses} />
@@ -900,11 +1453,14 @@ function TipsView() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export default function App() {
-  const [expenses,    setExpenses]    = useState([]);
-  const [authSession, setAuthSession] = useState(null);
-  const [showForm,    setShowForm]    = useState(false);
-  const [activeTab,   setActiveTab]   = useState("tracker");
-  const [ready,       setReady]       = useState(false);
+  const [expenses,     setExpenses]     = useState([]);
+  const [authSession,  setAuthSession]  = useState(null);
+  const [totalBalance, setTotalBalance] = useState(0);
+  const [showForm,     setShowForm]     = useState(false);
+  const [showBalance,  setShowBalance]  = useState(false);
+  const [activeTab,    setActiveTab]    = useState("tracker");
+  const [ready,        setReady]        = useState(false);
+  const [settings,     setSettings]     = useState({ monthlyBudget: "", currency: "EUR" });
 
   useEffect(() => {
     authStore.load().then(async (session) => {
@@ -912,6 +1468,10 @@ export default function App() {
       if (session?.user?.email) {
         const data = await store.load(session.user.email);
         setExpenses(data);
+        const bal = await balanceStore.load(session.user.email);
+        setTotalBalance(bal);
+        const s = await settingsStore.load(session.user.email);
+        setSettings(s);
       }
       setReady(true);
     });
@@ -923,20 +1483,49 @@ export default function App() {
     }
   }, [expenses, ready, authSession]);
 
+  useEffect(() => {
+    if (ready && authSession?.user?.email) {
+      balanceStore.save(authSession.user.email, totalBalance);
+    }
+  }, [totalBalance, ready, authSession]);
+
+  useEffect(() => {
+    if (ready && authSession?.user?.email) {
+      settingsStore.save(authSession.user.email, settings);
+    }
+  }, [settings, ready, authSession]);
+
   const addExpense    = (exp) => setExpenses((prev) => [exp, ...prev]);
   const deleteExpense = (id)  => setExpenses((prev) => prev.filter((e) => e.id !== id));
 
   const handleAuth = async (session) => {
     const data = await store.load(session.user.email);
     setExpenses(data);
+    const bal = await balanceStore.load(session.user.email);
+    setTotalBalance(bal);
+    const s = await settingsStore.load(session.user.email);
+    setSettings(s);
     setAuthSession(session);
   };
 
   const handleLogout = async () => {
     await authStore.clear();
-    setExpenses([]);         // clear before nulling session — no flash of other user's data
+    setExpenses([]);
+    setTotalBalance(0);
+    setSettings({ monthlyBudget: "", currency: "EUR" });
     setAuthSession(null);
     setActiveTab("tracker");
+  };
+
+  const handleUpdateUser = async (updates) => {
+    const users = await usersStore.load();
+    if (users[authSession.user.email]) {
+      Object.assign(users[authSession.user.email], updates);
+      await usersStore.save(users);
+    }
+    const updated = { ...authSession, user: { ...authSession.user, ...updates } };
+    await authStore.save(updated);
+    setAuthSession(updated);
   };
 
   const today = todayISO();
@@ -950,6 +1539,8 @@ export default function App() {
     () => expenses.filter((e) => e.date.startsWith(month)).reduce((s, e) => s + e.amount, 0),
     [expenses]
   );
+  const allTimeTotal     = useMemo(() => expenses.reduce((s, e) => s + e.amount, 0), [expenses]);
+  const availableBalance = totalBalance - allTimeTotal;
 
   // Loading spinner
   if (!ready) {
@@ -977,16 +1568,27 @@ export default function App() {
             todayTotal={todayTotal}
             onAddClick={() => setShowForm(true)}
             user={authSession.user}
-            onLogout={handleLogout}
+            availableBalance={availableBalance}
+            onEditBalance={() => setShowBalance(true)}
           />
         )}
         {activeTab === "analytics" && <AnalyticsView expenses={expenses} />}
         {activeTab === "tips"      && <TipsView />}
+        {activeTab === "profile"   && (
+          <ProfileView
+            user={authSession.user}
+            onLogout={handleLogout}
+            settings={settings}
+            onSaveSettings={(s) => setSettings(s)}
+            onUpdateUser={handleUpdateUser}
+          />
+        )}
       </div>
 
       <BottomNav active={activeTab} onChange={setActiveTab} />
 
-      {showForm && <AddExpenseModal onAdd={addExpense} onClose={() => setShowForm(false)} />}
+      {showForm    && <AddExpenseModal onAdd={addExpense} onClose={() => setShowForm(false)} />}
+      {showBalance && <SetBalanceModal current={totalBalance} onSave={setTotalBalance} onClose={() => setShowBalance(false)} />}
     </div>
   );
 }
